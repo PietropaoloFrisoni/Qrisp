@@ -20,6 +20,7 @@ from typing import List, Tuple
 
 from qrisp.circuit.instruction import Instruction
 from qrisp.environments.quantum_environments import QuantumEnvironment
+from jax.extend.core import ClosedJaxpr, Literal
 
 
 class GateStack(QuantumEnvironment):
@@ -298,3 +299,40 @@ class LayeredEnvironment(QuantumEnvironment):
                 for stack in items:
                     stack.compile()
                 self._interleave_layers(items)
+
+    def jcompile(self, eqn, context_dic) -> None:
+
+        from qrisp.jasp import eval_jaxpr, extract_invalues, insert_outvalues
+
+        interpreter_instance = LayeredEnvironmentJaspInterpreter(eqn, context_dic)
+
+        args = extract_invalues(eqn, context_dic)
+        jaspr_unflattened = eqn.params["jaspr"]
+
+        # Default implementation:
+
+        # args = extract_invalues(eqn, context_dic)
+        # flattened_envs = eqn.params["jaspr"].flatten_environments()
+
+        # res = eval_jaxpr(flattened_envs)(*args)
+        # res = (res,) if not isinstance(res, tuple) else res
+
+        # insert_outvalues(eqn, context_dic, res)
+
+
+class LayeredEnvironmentJaspInterpreter:
+    """Interpreter for layered environments in JASP."""
+
+    def __init__(self, eqn, context_dic):
+        self.eqn = eqn
+        self.context_dic = context_dic
+
+    # `eqn` and `context_dic` are NOT the instance attributes
+    def eqn_evaluator(self, eqn, context_dic):
+
+        prim = eqn.primitive
+        prim_type = prim.params.get("type", None) if hasattr(prim, "params") else None
+
+        if prim.name == "jasp.q_env" and prim_type == "GateStack":
+            # We are inside a GateStack, so we want to collect the layers and interleave
+            print("Compiling a GateStack")

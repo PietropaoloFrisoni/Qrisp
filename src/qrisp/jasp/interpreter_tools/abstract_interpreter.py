@@ -207,7 +207,7 @@ def reinterpret(jaxpr, eqn_evaluator: Callable = exec_eqn) -> Jaxpr | ClosedJaxp
     ----------
     jaxpr : Jaxpr | ClosedJaxpr
         The Jaxpr to reinterpret.
-        
+
     eqn_evaluator : Callable, optional
         The custom equation evaluator, by default exec_eqn.
 

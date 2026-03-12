@@ -18,9 +18,14 @@
 
 from typing import List, Tuple
 
+import jax.core as jc
+from jax.extend.core import ClosedJaxpr, JaxprEqn, Literal, Var
+
 from qrisp.circuit.instruction import Instruction
 from qrisp.environments.quantum_environments import QuantumEnvironment
-from jax.extend.core import ClosedJaxpr, Literal
+from qrisp.jasp.interpreter_tools.abstract_interpreter import ContextDict
+from qrisp.jasp.jasp_expression import Jaspr
+from qrisp.jasp.primitives import AbstractQuantumState
 
 
 class GateStack(QuantumEnvironment):
@@ -300,39 +305,228 @@ class LayeredEnvironment(QuantumEnvironment):
                     stack.compile()
                 self._interleave_layers(items)
 
-    def jcompile(self, eqn, context_dic) -> None:
+    def jcompile(self, eqn: JaxprEqn, context_dic: ContextDict) -> None:
+        """jcompile by flattening the inner jaspr of the q_env/GateStack and evaluating it with the given context_dic."""
 
         from qrisp.jasp import eval_jaxpr, extract_invalues, insert_outvalues
 
-        interpreter_instance = LayeredEnvironmentJaspInterpreter(eqn, context_dic)
-
+        flat_jaspr = flatten_layered_environment(eqn)
+        print("Flattened Jaspr for LayeredEnvironment:")
+        print(flat_jaspr)
         args = extract_invalues(eqn, context_dic)
-        jaspr_unflattened = eqn.params["jaspr"]
-
-        # Default implementation:
-
-        # args = extract_invalues(eqn, context_dic)
-        # flattened_envs = eqn.params["jaspr"].flatten_environments()
-
-        # res = eval_jaxpr(flattened_envs)(*args)
-        # res = (res,) if not isinstance(res, tuple) else res
-
-        # insert_outvalues(eqn, context_dic, res)
+        res = eval_jaxpr(flat_jaspr)(*args)
+        res = (res,) if not isinstance(res, tuple) else res
+        insert_outvalues(eqn, context_dic, res)
 
 
-class LayeredEnvironmentJaspInterpreter:
-    """Interpreter for layered environments in JASP."""
+def _is_quantum_state(var):
+    """Check if a variable holds a QuantumState."""
+    return isinstance(var.aval, AbstractQuantumState)
 
-    def __init__(self, eqn, context_dic):
-        self.eqn = eqn
-        self.context_dic = context_dic
 
-    # `eqn` and `context_dic` are NOT the instance attributes
-    def eqn_evaluator(self, eqn, context_dic):
+def _substitute_eqn(eqn, subst):
+    new_invars = []
+    for v in eqn.invars:
+        if isinstance(v, Literal):
+            new_invars.append(v)
+        else:
+            new_invars.append(subst.get(v, v))
 
-        prim = eqn.primitive
-        prim_type = prim.params.get("type", None) if hasattr(prim, "params") else None
+    new_outvars = []
+    for v in eqn.outvars:
+        if isinstance(v, jc.DropVar) and not _is_quantum_state(v):
+            # Keep DropVar only for non-state outputs
+            new_outvars.append(v)
+        else:
+            # Always generate a fresh var for QuantumState outputs,
+            # even if the original was a DropVar
+            fresh = Var(v.aval)
+            subst[v] = fresh
+            new_outvars.append(fresh)
 
-        if prim.name == "jasp.q_env" and prim_type == "GateStack":
-            # We are inside a GateStack, so we want to collect the layers and interleave
-            print("Compiling a GateStack")
+    return JaxprEqn(
+        invars=new_invars,
+        outvars=new_outvars,
+        primitive=eqn.primitive,
+        params=eqn.params,
+        effects=eqn.effects,
+        source_info=eqn.source_info,
+        ctx=eqn.ctx,
+    )
+
+
+def _prepare_segments(eqns: List[JaxprEqn]) -> List[Tuple[str, List[JaxprEqn]]]:
+    """
+    Segment a flat list of equations into runs of GateStacks and bare instructions.
+
+    Returns
+    -------
+    list of ("bare" | "stacks", list of JaxprEqn)
+    """
+    segments = []
+    for eqn in eqns:
+        is_gatestack = (
+            eqn.primitive.name == "jasp.q_env" and eqn.params.get("type") == "GateStack"
+        )
+        seg_type = "stacks" if is_gatestack else "bare"
+
+        if segments and segments[-1][0] == seg_type:
+            segments[-1][1].append(eqn)
+        else:
+            segments.append((seg_type, [eqn]))
+
+    return segments
+
+
+def _interleave_gatestack_segment(
+    stack_eqns: List[JaxprEqn], incoming_state_var: Var
+) -> Tuple[List[JaxprEqn], Var]:
+    """
+    Interleave layers from consecutive GateStack equations in brick order,
+    lifting all inner equations into the outer namespace.
+
+    Parameters
+    ----------
+    stack_eqns : list of JaxprEqn
+        Consecutive q_env/GateStack equations.
+    incoming_state_var : Var
+        The QuantumState entering this block.
+
+
+    Returns
+    -------
+    list of JaxprEqn
+        Interleaved, lifted equations.
+    Var
+        The final outgoing QuantumState variable.
+    """
+    # Extract raw inner eqns per stack (still in inner namespace)
+    stacks_inner_eqns = [eqn.params["jaspr"].eqns for eqn in stack_eqns]
+    max_layers = max(len(layers) for layers in stacks_inner_eqns)
+
+    # Build interleaved sequence of (stack_idx, layer_eqn) pairs
+    interleaved_pairs = []
+    for layer_idx in range(max_layers):
+        for stack_idx, layers in enumerate(stacks_inner_eqns):
+            if layer_idx < len(layers):
+                interleaved_pairs.append((stack_idx, layers[layer_idx]))
+
+    # Build one substitution map per stack for non-state invars
+    # The QuantumState invar is threaded dynamically below
+    subst_maps = []
+    for stack_eqn in stack_eqns:
+        inner_jaspr = stack_eqn.params["jaspr"]
+        inner_invars = list(inner_jaspr.invars)
+        outer_invars = list(stack_eqn.invars)
+        subst = {}
+        for inner_v, outer_v in zip(inner_invars[:-1], outer_invars[:-1]):
+            subst[inner_v] = outer_v
+        subst_maps.append(subst)
+
+    current_state = incoming_state_var
+    lifted_eqns = []
+
+    for stack_idx, inner_eqn in interleaved_pairs:
+        subst = subst_maps[stack_idx]
+
+        # Override the QuantumState input of THIS specific equation,
+        # not just the jaspr-level state invar.
+        # This correctly handles both the first equation (which consumes the
+        # jaspr invar) and subsequent ones (which consume local state vars).
+        for v in inner_eqn.invars:
+            if (
+                not isinstance(v, Literal)
+                and not isinstance(v, jc.DropVar)
+                and _is_quantum_state(v)
+            ):
+                subst[v] = current_state
+
+        new_eqn = _substitute_eqn(inner_eqn, subst)
+        lifted_eqns.append(new_eqn)
+
+        for outvar in new_eqn.outvars:
+            if not isinstance(outvar, jc.DropVar) and _is_quantum_state(outvar):
+                current_state = outvar
+
+    return lifted_eqns, current_state
+
+
+def _rewire_bare_eqn(
+    eqn: JaxprEqn, incoming_state_var: Var, Var: type
+) -> Tuple[JaxprEqn, Var]:
+    """
+    Re-wire a single bare (non-GateStack) equation's QuantumState
+    to use incoming_state_var, producing a fresh outgoing state variable.
+    """
+    new_invars = []
+    for v in eqn.invars:
+        if isinstance(v, Literal):
+            new_invars.append(v)
+        elif not isinstance(v, jc.DropVar) and _is_quantum_state(v):
+            new_invars.append(incoming_state_var)
+        else:
+            new_invars.append(v)
+
+    new_outvars = []
+    outgoing_state = incoming_state_var
+    for v in eqn.outvars:
+        if isinstance(v, jc.DropVar):
+            new_outvars.append(v)
+        elif _is_quantum_state(v):
+            fresh = Var(v.aval)
+            new_outvars.append(fresh)
+            outgoing_state = fresh
+        else:
+            new_outvars.append(v)
+
+    return (
+        JaxprEqn(
+            invars=new_invars,
+            outvars=new_outvars,
+            primitive=eqn.primitive,
+            params=eqn.params,
+            effects=eqn.effects,
+            source_info=eqn.source_info,
+            ctx=eqn.ctx,
+        ),
+        outgoing_state,
+    )
+
+
+def flatten_layered_environment(q_env_eqn: JaxprEqn) -> Jaspr:
+    """
+    Takes the outer q_env equation for a LayeredEnvironment, extracts its
+    inner jaspr, performs the layer interleaving, and returns a new flat
+    jaspr ready for execution.
+    """
+
+    outer_jaspr = q_env_eqn.params["jaspr"]
+
+    print(f"jaspr received by `flatten_layered_environment`: {outer_jaspr}")
+
+    # The incoming QuantumState is always the last invar of the outer jaspr
+    # by Jaspr convention — no need to look it up from context_dic
+    current_state = outer_jaspr.invars[-1]
+
+    segments = _prepare_segments(outer_jaspr.eqns)
+    new_eqns = []
+
+    for seg_type, items in segments:
+        if seg_type == "bare":
+            for eqn in items:
+                new_eqn, current_state = _rewire_bare_eqn(eqn, current_state, Var)
+                new_eqns.append(new_eqn)
+        else:
+            interleaved, current_state = _interleave_gatestack_segment(
+                items, current_state
+            )
+            new_eqns.extend(interleaved)
+
+    return Jaspr(
+        constvars=list(outer_jaspr.constvars),
+        invars=list(outer_jaspr.invars),
+        outvars=list(outer_jaspr.outvars[:-1]) + [current_state],
+        eqns=new_eqns,
+        consts=list(outer_jaspr.consts),
+        debug_info=outer_jaspr.debug_info,
+    )

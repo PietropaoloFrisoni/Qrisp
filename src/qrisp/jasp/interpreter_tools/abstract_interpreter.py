@@ -20,7 +20,7 @@ from typing import Callable
 
 import jax.numpy as jnp
 from jax import make_jaxpr
-from jax.extend.core import ClosedJaxpr, Literal
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 
 from qrisp.jasp import check_for_tracing_mode
 
@@ -107,8 +107,24 @@ class ContextDict(dict):
         return res
 
 
-def exec_eqn(eqn, context_dic):
-    """Evaluate a single equation within the given context dictionary."""
+def exec_eqn(eqn: JaxprEqn, context_dic: ContextDict) -> None:
+    """
+    Execute a single Jax primitive equation within the given context.
+
+    This function extracts input values from the context dictionary, applies the
+    primitive operation with its parameters, and stores the resulting output values
+    back into the context dictionary.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        A Jax equation containing a primitive operation, its inputs,
+        outputs, and parameters.
+
+    context_dic : ContextDict
+        A dictionary maintaining variable bindings and
+        state throughout the interpretation.
+    """
 
     invalues = extract_invalues(eqn, context_dic)
     res = eqn.primitive.bind(*invalues, **eqn.params)
@@ -179,26 +195,42 @@ def eval_jaxpr(jaxpr, return_context_dic=False, eqn_evaluator=exec_eqn) -> Calla
     return jaxpr_evaluator
 
 
-def reinterpret(jaxpr, eqn_evaluator=exec_eqn):
+def reinterpret(jaxpr, eqn_evaluator: Callable = exec_eqn) -> Jaxpr | ClosedJaxpr:
+    """
+    Reinterpret a Jaxpr by tracing through the custom equation evaluator.
 
-    if isinstance(jaxpr, ClosedJaxpr):
-        inter_jaxpr = jaxpr.jaxpr
-    else:
-        inter_jaxpr = jaxpr
+    This function applies a custom interpreter to a Jaxpr and captures the
+    result as a new Jaxpr, effectively "freezing" the specific semantics
+    into a concrete JAX expression.
 
-    res = make_jaxpr(eval_jaxpr(inter_jaxpr, eqn_evaluator=eqn_evaluator))(
-        *[var.aval for var in inter_jaxpr.constvars + inter_jaxpr.invars]
-    ).jaxpr
+    Parameters
+    ----------
+    jaxpr : Jaxpr | ClosedJaxpr
+        The Jaxpr to reinterpret.
 
-    res.constvars.extend(res.invars[: len(inter_jaxpr.constvars)])
-    temp = list(res.invars[len(inter_jaxpr.constvars) :])
-    res.invars.clear()
-    res.invars.extend(temp)
+    eqn_evaluator : Callable, optional
+        The custom equation evaluator, by default exec_eqn.
 
-    if isinstance(jaxpr, ClosedJaxpr):
-        res = ClosedJaxpr(res, jaxpr.consts)
+    Returns
+    -------
+    Jaxpr | ClosedJaxpr
+        The reinterpreted Jaxpr with the same type as input.
+    """
 
-    return res
+    is_closed = isinstance(jaxpr, ClosedJaxpr)
+    inner_jaxpr = jaxpr.jaxpr if is_closed else jaxpr
+
+    jaxpr_evaluator = eval_jaxpr(inner_jaxpr, eqn_evaluator=eqn_evaluator)
+
+    abstract_values = [var.aval for var in inner_jaxpr.constvars + inner_jaxpr.invars]
+    traced_jaxpr = make_jaxpr(jaxpr_evaluator)(*abstract_values).jaxpr
+
+    # Restore the constvar/invar separation in the traced Jaxpr
+    num_constvars = len(inner_jaxpr.constvars)
+    traced_jaxpr.constvars.extend(traced_jaxpr.invars[:num_constvars])
+    traced_jaxpr.invars[:] = traced_jaxpr.invars[num_constvars:]
+
+    return ClosedJaxpr(traced_jaxpr, jaxpr.consts) if is_closed else traced_jaxpr
 
 
 def eval_jaxpr_with_context_dic(jaxpr, context_dic, eqn_evaluator=exec_eqn):
